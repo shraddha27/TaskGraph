@@ -29,7 +29,7 @@ if LANGSMITH_API_KEY:
     try:
         client = Client(
             api_key=LANGSMITH_API_KEY,
-            endpoint=LANGSMITH_ENDPOINT
+            api_url=LANGSMITH_ENDPOINT
         )
         logger.info(f"LangSmith initialized with project: {LANGSMITH_PROJECT_NAME}")
     except Exception as e:
@@ -64,6 +64,7 @@ class LangSmithTracer:
             self.run = client.create_run(
                 name=self.name,
                 run_type=self.run_type,
+                project_name=LANGSMITH_PROJECT_NAME,
                 inputs=self.inputs,
                 tags=self.tags,
                 extra={"metadata": self.metadata}

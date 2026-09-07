@@ -9,7 +9,7 @@
       "architect": {
         "build": {
           "builder": "@angular-devkit/build-angular:browser",
-          "defaultConfiguration": "production",
+          "defaultConfiguration": "development",
           "options": {
             "outputPath": "dist/simple-task-app",
             "index": "src/index.html",
@@ -20,6 +20,7 @@
             "styles": ["src/styles.css"]
           },
           "configurations": {
+            "development": {},
             "production": {
               "fileReplacements": [
                 {
@@ -35,6 +36,7 @@
         },
         "serve": {
           "builder": "@angular-devkit/build-angular:dev-server",
+          "defaultConfiguration": "development",
           "options": {
             "browserTarget": "simple-task-app:build"
           },

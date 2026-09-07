@@ -1,0 +1,106 @@
+@startuml
+left to right direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+
+actor User
+
+package "Frontend Layer" {
+  component "Angular UI" as AngularUI
+  component "Task Management" as TaskUI
+  component "AI Chat" as ChatUI
+  component "Semantic Search" as SearchUI
+}
+
+package "API / Orchestration Layer" {
+  component "FastAPI API" as FastAPI
+  component "LangGraph Workflow" as LangGraph
+  component "Agent Manager" as AgentMgr
+  component "MCP Server" as MCPServer
+  component "Tool Registry" as ToolRegistry
+}
+
+package "AI Services" {
+  component "Task Agent" as TaskAgent
+  component "RAG Agent" as RAGAgent
+  component "Chat Agent" as ChatAgent
+  component "Analysis Agent" as AnalysisAgent
+  component "Coordinator Agent" as CoordinatorAgent
+  component "Embedding Service" as Embeddings
+  component "LLM Proposal Validator" as ProposalValidator
+}
+
+package "Enterprise Integrations" {
+  component "SharePoint" as SharePoint
+  component "Jira / GitHub / Slack" as ExternalTools
+}
+
+package "Observability" {
+  component "MLflow" as MLflow
+  component "LangSmith" as LangSmith
+}
+
+package "Data Layer" {
+  database "PostgreSQL + pgvector" as DB
+}
+
+User --> AngularUI
+AngularUI --> TaskUI
+AngularUI --> ChatUI
+AngularUI --> SearchUI
+
+TaskUI --> FastAPI
+ChatUI --> FastAPI
+SearchUI --> FastAPI
+
+FastAPI --> LangGraph
+LangGraph --> AgentMgr
+AgentMgr --> TaskAgent
+AgentMgr --> RAGAgent
+AgentMgr --> ChatAgent
+AgentMgr --> AnalysisAgent
+AgentMgr --> CoordinatorAgent
+
+TaskAgent --> MCPServer
+RAGAgent --> MCPServer
+ChatAgent --> MCPServer
+AnalysisAgent --> MCPServer
+CoordinatorAgent --> MCPServer
+
+MCPServer --> ToolRegistry
+ToolRegistry --> SharePoint
+ToolRegistry --> ExternalTools
+
+FastAPI --> Embeddings
+Embeddings --> DB
+TaskAgent --> DB
+RAGAgent --> DB
+AnalysisAgent --> DB
+CoordinatorAgent --> DB
+
+TaskAgent --> ProposalValidator
+RAGAgent --> ProposalValidator
+ChatAgent --> ProposalValidator
+AnalysisAgent --> ProposalValidator
+CoordinatorAgent --> ProposalValidator
+
+LangGraph --> MLflow
+LangGraph --> LangSmith
+MCPServer --> MLflow
+MCPServer --> LangSmith
+TaskAgent --> MLflow
+RAGAgent --> MLflow
+TaskAgent --> LangSmith
+RAGAgent --> LangSmith
+
+DB --> "Tasks"
+DB --> "Users"
+DB --> "Roles"
+DB --> "Documents"
+DB --> "Vector Embeddings"
+
+MLflow --> "Experiments / Metrics"
+LangSmith --> "Trace Spans / Logs"
+
+@enduml
