@@ -1,5 +1,7 @@
 # Task Management App
 
+For model training details, see [AI_MODELS_FINETUNING_GUIDE.md](AI_MODELS_FINETUNING_GUIDE.md).
+
 A full-stack task management app with:
 
 - Angular frontend
