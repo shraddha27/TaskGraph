@@ -28,3 +28,53 @@ backend_django/venv
 .vscode/
 frontend/.angular/cache
 mlruns
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling and test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Frontend build and tooling output
+frontend/.angular/
+frontend/dist/
+frontend/coverage/
+frontend/.cache/
+
+# Local model downloads, fine-tuning outputs, and checkpoints
+backend_fastapi/fine_tuned_task_embedder/
+local_lora_adapter_chat/
+local_lora_adapter_strict/
+**/checkpoint-*/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.model
+
+# Local certificates and credentials
+*.pem
+*.key
+*.crt
+.secrets/
+!.env.example
+!**/.env.example
+
+# Temporary scripts, test databases, and generated output
+*.db
+*.sqlite
+*.sqlite3
+tmp_*
+*_output.txt

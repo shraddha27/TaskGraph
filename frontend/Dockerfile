@@ -5,7 +5,8 @@ RUN npm install --legacy-peer-deps
 
 COPY . .
 
-RUN npm run build -- --configuration production
+ARG BUILD_CONFIGURATION=production
+RUN npm run build -- --configuration ${BUILD_CONFIGURATION}
 
 FROM nginx:stable-alpine
 COPY --from=build /app/dist/simple-task-app /usr/share/nginx/html
