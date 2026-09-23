@@ -15,6 +15,7 @@ from backend_fastapi.startup import startup_event
 from backend_fastapi.tasks import tasks_router
 from backend_fastapi.agents.routes import router as agents_router
 from backend_fastapi.routes_mcp import router as mcp_router
+from backend_fastapi.ops_routes import router as ops_router
 
 
 @asynccontextmanager
@@ -48,5 +49,6 @@ app.include_router(ai_router)
 app.include_router(workflow_router)
 app.include_router(agents_router)
 app.include_router(mcp_router)
+app.include_router(ops_router)
 
 __all__ = ["app"]

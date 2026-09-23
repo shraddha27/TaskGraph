@@ -31,6 +31,7 @@ mlruns
 
 # Local Python environments
 .venv/
+.venv311/
 venv/
 env/
 ENV/
@@ -53,6 +54,7 @@ frontend/.cache/
 
 # Local model downloads, fine-tuning outputs, and checkpoints
 backend_fastapi/fine_tuned_task_embedder/
+backend_fastapi/evaluation/
 local_lora_adapter_chat/
 local_lora_adapter_strict/
 **/checkpoint-*/
@@ -63,6 +65,7 @@ local_lora_adapter_strict/
 *.onnx
 *.gguf
 *.model
+*.joblib
 
 # Local certificates and credentials
 *.pem
@@ -78,3 +81,6 @@ local_lora_adapter_strict/
 *.sqlite3
 tmp_*
 *_output.txt
+*.pdf
+nul
+preserve_resume_format_update.py

@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 from sentence_transformers import InputExample, SentenceTransformer, losses
 from torch.utils.data import DataLoader
 
+from backend_fastapi.ops import embedding_model_manifest
+
 
 DEFAULT_LOCAL_MODEL = "./hg_model"
 DEFAULT_DATASETS = [
@@ -187,6 +189,24 @@ def train_sentence_transformer(
         optimizer_params={"lr": learning_rate},
         output_path=output_dir,
         save_best_model=True,
+    )
+
+    manifest = embedding_model_manifest(
+        model_name=model_name_or_path,
+        model_path=output_dir,
+        backend="local_sentence_transformer",
+        dimension=model.get_sentence_embedding_dimension(),
+    )
+    manifest.update({
+        "training_pairs": len(pairs),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+    })
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir) / "embedding_manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
     )
 
     return model

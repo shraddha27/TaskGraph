@@ -25,9 +25,10 @@ from backend_fastapi.rag_tools import (
     filter_tasks_by_query,
     search_tasks as rag_search_tasks,
 )
-from backend_fastapi.search import cleanup_duplicate_documents, vector_search
+from backend_fastapi.search import cleanup_duplicate_documents, hybrid_search
 from backend_fastapi.mlflow_tracking import MLflowTracker, log_artifact_json
 from backend_fastapi.langsmith_tracing import is_langsmith_enabled
+from backend_fastapi.ops import validate_operational_config
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ def startup_event():
     # Log startup configuration
     langsmith_enabled = is_langsmith_enabled()
     logger.info(f"LangSmith tracing enabled: {langsmith_enabled}")
+    for warning in validate_operational_config():
+        logger.warning("Operational configuration: %s", warning)
     
     db: Session = SessionLocal()
     try:
@@ -75,24 +78,40 @@ def startup_event():
 
     try:
         inspector = inspect(engine)
+        document_columns = {col['name'] for col in inspector.get_columns('documents')}
+        if 'chunk_index' not in document_columns:
+            db.execute(text('ALTER TABLE documents ADD COLUMN chunk_index INTEGER NOT NULL DEFAULT 0'))
+        if 'chunk_count' not in document_columns:
+            db.execute(text('ALTER TABLE documents ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 1'))
+        if 'project' not in document_columns:
+            db.execute(text('ALTER TABLE documents ADD COLUMN project VARCHAR(255) NULL'))
+        if 'document_type' not in document_columns:
+            db.execute(text('ALTER TABLE documents ADD COLUMN document_type VARCHAR(100) NULL'))
+        if 'owner_user_id' not in document_columns:
+            db.execute(text('ALTER TABLE documents ADD COLUMN owner_user_id INTEGER NULL'))
+        db.execute(text('ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_task_id_key'))
+        db.execute(text('DROP INDEX IF EXISTS documents_task_id_unique_idx'))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
+        inspector = inspect(engine)
         columns = {col['name'] for col in inspector.get_columns('tasks')}
         if 'completed_at' not in columns:
             db.execute(text('ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP NULL'))
-            db.commit()
+        if 'due_at' not in columns:
+            db.execute(text('ALTER TABLE tasks ADD COLUMN due_at TIMESTAMP NULL'))
+        if 'priority' not in columns:
+            db.execute(text("ALTER TABLE tasks ADD COLUMN priority VARCHAR(20) NOT NULL DEFAULT 'medium'"))
+        if 'estimated_hours' not in columns:
+            db.execute(text('ALTER TABLE tasks ADD COLUMN estimated_hours DOUBLE PRECISION NULL'))
+        db.commit()
     except Exception:
         db.rollback()
 
     try:
         cleanup_duplicate_documents(db)
-        db.execute(
-            text(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS documents_task_id_unique_idx
-                ON documents (task_id)
-                WHERE task_id IS NOT NULL
-                """
-            )
-        )
         db.commit()
     except Exception:
         db.rollback()
@@ -163,9 +182,11 @@ def startup_event():
         async def vector_search_handler(query: str, limit: int = 5, threshold: float = 0.08):
             db = SessionLocal()
             try:
-                query_embedding = generate_embedding(query)
-                docs = vector_search(db, query_embedding, limit=limit)
-                results = [d for d in docs if d["similarity_score"] >= threshold]
+                docs = hybrid_search(db, query, limit=limit)
+                results = [
+                    d for d in docs
+                    if d.get("retrieval_score", d.get("similarity_score", 0.0)) >= threshold
+                ]
                 return {"results": results, "count": len(results)}
             finally:
                 db.close()

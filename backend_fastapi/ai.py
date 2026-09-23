@@ -6,6 +6,7 @@ import re
 import tempfile
 import time
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form, status
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from backend_fastapi.auth import get_current_user_dep
 from backend_fastapi.embeddings import generate_embedding
-from backend_fastapi.models import DocumentModel, TaskModel, get_db
+from backend_fastapi.models import ConversationMessage, DocumentModel, TaskModel, get_db
 from backend_fastapi.mcp_server import ToolCallRequest
 from backend_fastapi.rag_tools import TOOL_DEFINITIONS
 from backend_fastapi.schemas import (
@@ -31,9 +32,9 @@ from backend_fastapi.search import (
     _semantic_intent,
     _tool_call,
     _tool_from_semantic_intent,
+    hybrid_search,
     resolve_task_id_from_query,
     sync_task_document,
-    vector_search,
 )
 from backend_fastapi.mistral_client import (
     MISTRAL_API_KEY,
@@ -44,8 +45,9 @@ from backend_fastapi.mistral_client import (
     generate_response,
 )
 import backend_fastapi.state as state
-from backend_fastapi.mlflow_tracking import MLflowTracker, track_vector_search, track_workflow_execution
+from backend_fastapi.mlflow_tracking import MLflowTracker, log_answer_quality, log_mistral_call, log_retrieval_quality, track_vector_search, track_workflow_execution
 from backend_fastapi.langsmith_tracing import trace_workflow_execution, trace_llm_call
+from backend_fastapi.ops import evaluate_answer_quality, get_provider_config
 
 logger = logging.getLogger(__name__)
 
@@ -722,17 +724,33 @@ async def search_documents(payload: SearchRequest, request: Request, db: Session
     start_time = time.time()
     with MLflowTracker("vector_search", tags={"type": "search", "operation": "vector_search"}):
         user = await get_current_user_dep(request)
-        query_embedding = await asyncio.get_event_loop().run_in_executor(None, generate_embedding, payload.query)
-        documents = vector_search(db, query_embedding, limit=payload.limit if hasattr(payload, 'limit') else 5)
+        documents = await asyncio.get_event_loop().run_in_executor(
+            None,
+            hybrid_search,
+            db,
+            payload.query,
+            payload.limit if hasattr(payload, "limit") else 5,
+            True,
+            True,
+            {
+                key: value for key, value in {
+                    "task_id": payload.task_id,
+                    "project": payload.project,
+                    "document_type": payload.document_type,
+                }.items() if value is not None
+            },
+        )
         ranked_results = [
             SearchResult(
                 id=doc["id"],
                 title=doc["title"],
                 content=doc["content"][:200],
-                similarity_score=doc["similarity_score"],
+                similarity_score=doc.get("retrieval_score", doc.get("similarity_score", 0.0)),
+                citation_id=doc.get("citation_id"),
+                chunk_index=doc.get("chunk_index"),
             )
             for doc in documents
-            if doc["similarity_score"] >= 0.08
+            if doc.get("retrieval_score", doc.get("similarity_score", 0.0)) >= 0.08
         ]
         
         # Track metrics
@@ -742,6 +760,7 @@ async def search_documents(payload: SearchRequest, request: Request, db: Session
             results_count=len(ranked_results),
             similarity_threshold=0.08
         )
+        log_retrieval_quality(payload.query, documents)
         trace_workflow_execution(
             workflow_name="vector_search",
             user_input=payload.query,
@@ -766,11 +785,7 @@ async def index_documents(payload: IndexDocumentsRequest, request: Request, db: 
     indexed_count = 0
 
     for task in tasks:
-        db.query(DocumentModel).filter(DocumentModel.task_id == task.id).delete()
-        content = f"{task.title}\n{task.description}"
-        embedding = await asyncio.get_event_loop().run_in_executor(None, generate_embedding, content)
-        doc = DocumentModel(task_id=task.id, title=task.title, content=content, embedding=embedding)
-        db.add(doc)
+        sync_task_document(db, task)
         indexed_count += 1
 
     try:
@@ -787,22 +802,50 @@ async def ai_chat(payload: ChatRequest, request: Request, db: Session = Depends(
     start_time = time.time()
     with MLflowTracker("ai_chat", tags={"type": "ai_request", "operation": "chat"}):
         user = await get_current_user_dep(request)
-        response_data = {"message": payload.message, "context": None, "tool_calls": None, "response": ""}
+        conversation_id = payload.conversation_id or str(uuid.uuid4())
+        recent_messages = db.query(ConversationMessage).filter(
+            ConversationMessage.user_id == user.id,
+            ConversationMessage.conversation_id == conversation_id,
+        ).order_by(ConversationMessage.created_at.desc()).limit(10).all()
+        recent_messages.reverse()
+        conversation_context = "\n".join(f"{item.role}: {item.content}" for item in recent_messages)
+        response_data = {
+            "message": payload.message,
+            "conversation_id": conversation_id,
+            "context": None,
+            "tool_calls": None,
+            "response": "",
+        }
+        db.add(ConversationMessage(
+            conversation_id=conversation_id,
+            user_id=user.id,
+            role="user",
+            content=payload.message,
+        ))
 
         context_docs = []
         context_text = ""
         if payload.use_context:
-            query_embedding = await asyncio.get_event_loop().run_in_executor(None, generate_embedding, payload.message)
-            context_docs = vector_search(db, query_embedding, limit=3)
-            context_docs = [doc for doc in context_docs if doc["similarity_score"] >= 0.2]
-            context_text = "\n\n".join([f"- {doc['title']}: {doc['content'][:150]}" for doc in context_docs])
+            context_docs = await asyncio.get_event_loop().run_in_executor(
+                None, hybrid_search, db, payload.message, 3
+            )
+            context_docs = [
+                doc for doc in context_docs
+                if doc.get("retrieval_score", doc.get("similarity_score", 0.0)) >= 0.08
+            ]
+            context_text = "\n\n".join([
+                f"[{doc.get('citation_id') or 'doc-' + str(doc['id'])}] {doc['title']}: {doc['content'][:150]}"
+                for doc in context_docs
+            ])
             if context_docs:
                 response_data["context"] = [
                     SearchResult(
                         id=doc["id"],
                         title=doc["title"],
                         content=doc["content"][:200],
-                        similarity_score=doc["similarity_score"],
+                        similarity_score=doc.get("retrieval_score", doc.get("similarity_score", 0.0)),
+                        citation_id=doc.get("citation_id"),
+                        chunk_index=doc.get("chunk_index"),
                     )
                     for doc in context_docs
                 ]
@@ -837,13 +880,43 @@ async def ai_chat(payload: ChatRequest, request: Request, db: Session = Depends(
         if verified_response is not None:
             response_data["response"] = verified_response
         else:
-            agent_response = await _run_chat_agent(payload.message, context_text if payload.use_context else None, tool_results_text if tool_results_text else None)
+            combined_context = "\n\n".join(item for item in [conversation_context, context_text] if item)
+            citation_instruction = (
+                "Use the provided source citation IDs for factual claims. "
+                "If the context does not support an answer, explicitly say that evidence is insufficient."
+            )
+            agent_response = await _run_chat_agent(
+                f"{payload.message}\n\n{citation_instruction}",
+                combined_context or None,
+                tool_results_text if tool_results_text else None,
+            )
             if not agent_response or not agent_response.get("response"):
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Agent chat pipeline is not available")
             response_data["response"] = agent_response["response"]
+
+        response_data["quality"] = evaluate_answer_quality(
+            response_data["response"],
+            context_text,
+            tool_results_text,
+        )
+        log_answer_quality(response_data["quality"])
+        db.add(ConversationMessage(
+            conversation_id=conversation_id,
+            user_id=user.id,
+            role="assistant",
+            content=response_data["response"],
+        ))
+        db.commit()
         
         # Track metrics
         execution_time = time.time() - start_time
+        log_mistral_call(
+            prompt=payload.message,
+            response=response_data["response"],
+            model=os.getenv("MISTRAL_MODEL", "mistral-tiny"),
+            temperature=0.0,
+            latency=execution_time,
+        )
         trace_llm_call(
             model="mistral",
             prompt=payload.message,

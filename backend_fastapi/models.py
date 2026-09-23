@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 from typing import Iterator
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, ForeignKey, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, ForeignKey, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
@@ -61,6 +61,9 @@ class TaskModel(Base):
     description = Column(Text, nullable=False, default="")
     completed = Column(Boolean, nullable=False, default=False)
     completed_at = Column(DateTime, nullable=True)
+    due_at = Column(DateTime, nullable=True)
+    priority = Column(String(20), nullable=False, default="medium")
+    estimated_hours = Column(Float, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -68,9 +71,25 @@ class DocumentModel(Base):
     __tablename__ = "documents"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True, unique=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
     title = Column(String(500), nullable=False)
     content = Column(Text, nullable=False)
     embedding = Column(Vector(384), nullable=False)
+    chunk_index = Column(Integer, nullable=False, default=0)
+    chunk_count = Column(Integer, nullable=False, default=1)
+    project = Column(String(255), nullable=True, index=True)
+    document_type = Column(String(100), nullable=True, index=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(String(100), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)

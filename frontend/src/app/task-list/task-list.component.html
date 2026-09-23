@@ -77,6 +77,15 @@
       </span>
     </div>
 
+    <div class="field">
+      <label>Priority</label>
+      <select [(ngModel)]="newPriority" name="priority">
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+      </select>
+    </div>
+
     <button type="submit" [disabled]="loading">
       {{ loading ? "Adding..." : "Add Task" }}
     </button>
@@ -129,12 +138,37 @@
           </button>
         </div>
       </div>
+
+      <div class="risk-row" *ngIf="task.intervention_required !== undefined">
+        <span class="risk-badge" [ngClass]="'risk-' + getRiskClass(task)">
+          {{ getRiskText(task) }}
+        </span>
+        <span class="probability-pill">
+          {{ (task.prediction_probability ?? 0) * 100 | number: '1.0-0' }}% likely
+        </span>
+      </div>
+
+      <div class="intervention-banner" *ngIf="task.intervention_required">
+        <strong>{{ task.recommended_action | titlecase }}</strong>
+        • suggested priority: {{ task.suggested_priority }}
+      </div>
+
       <p class="task-description">
         {{ task.description || "No description provided." }}
       </p>
       <small class="task-date">
         Created: {{ task.created_at | date: "medium" }}
       </small>
+      <div class="task-meta" *ngIf="task.intervention_required">
+        <button
+          *ngIf="authStore.isAdmin()"
+          type="button"
+          class="action-btn escalate-btn"
+          (click)="applyIntervention(task)"
+        >
+          🚨 Apply intervention
+        </button>
+      </div>
     </article>
   </div>
 

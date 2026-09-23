@@ -5,12 +5,14 @@ import hashlib
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, List, Optional
 
 import numpy as np
 import requests
 import urllib3
+from backend_fastapi.ops import embedding_model_manifest, record_embedding_observation
 
 # Disable SSL warnings for corporate proxy environments
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -390,13 +392,17 @@ def _ollama_embedding(text: str) -> Optional[List[float]]:
 
 def generate_embedding(text: str) -> List[float]:
     """Generate a text embedding using the model when available, otherwise fall back deterministically."""
-    embedding = _sentence_transformer_embedding(text)
-    if embedding is not None:
-        logger.debug("Embedding generated via sentence-transformers for text length=%s", len(text or ""))
-        return embedding
+    started_at = time.perf_counter()
+    try:
+        embedding = _sentence_transformer_embedding(text)
+        if embedding is not None:
+            logger.debug("Embedding generated via sentence-transformers for text length=%s", len(text or ""))
+            return embedding
 
-    logger.debug("Using deterministic local embedding fallback for text length=%s", len(text or ""))
-    return _fallback_embedding(text)
+        logger.debug("Using deterministic local embedding fallback for text length=%s", len(text or ""))
+        return _fallback_embedding(text)
+    finally:
+        record_embedding_observation(time.perf_counter() - started_at, EMBEDDING_DIMENSION)
 
 
 def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
@@ -439,3 +445,20 @@ def generate_embeddings_batch(texts: List[str]) -> List[List[float]]:
 def embedding_dimension() -> int:
     """Return the embedding dimension for pgvector setup."""
     return EMBEDDING_DIMENSION
+
+
+def embedding_model_manifest_status() -> dict:
+    """Return the runtime embedding model identity and loading configuration."""
+    local_path = Path(LOCAL_EMBEDDING_MODEL_PATH)
+    if _SENTENCE_TRANSFORMER_MODEL is not None:
+        backend = "local_sentence_transformer"
+    elif USE_REMOTE_EMBEDDING_API and HF_EMBEDDING_API_TOKEN:
+        backend = "remote_huggingface"
+    else:
+        backend = "deterministic_fallback"
+    return embedding_model_manifest(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_path=str(local_path) if local_path.exists() else "",
+        backend=backend,
+        dimension=EMBEDDING_DIMENSION,
+    )

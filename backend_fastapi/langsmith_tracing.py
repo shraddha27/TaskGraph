@@ -8,6 +8,8 @@ from typing import Optional, Dict, Any, List
 import logging
 from datetime import datetime
 
+from backend_fastapi.ops import redact_payload, redact_text
+
 try:
     import langsmith
     from langsmith.client import Client
@@ -48,12 +50,14 @@ class LangSmithTracer:
         inputs: Optional[Dict[str, Any]] = None,
         tags: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        outputs: Optional[Dict[str, Any]] = None,
     ):
         self.name = name
         self.run_type = run_type
         self.inputs = inputs or {}
         self.tags = tags or []
         self.metadata = metadata or {}
+        self.outputs = outputs
         self.run = None
     
     def __enter__(self):
@@ -65,7 +69,7 @@ class LangSmithTracer:
                 name=self.name,
                 run_type=self.run_type,
                 project_name=LANGSMITH_PROJECT_NAME,
-                inputs=self.inputs,
+                inputs=redact_payload(self.inputs),
                 tags=self.tags,
                 extra={"metadata": self.metadata}
             )
@@ -84,14 +88,14 @@ class LangSmithTracer:
                 client.update_run(
                     self.run.id,
                     end_time=datetime.utcnow(),
-                    error=str(exc_val),
+                    error=redact_text(str(exc_val)),
                     extra={"error_type": exc_type.__name__}
                 )
             else:
                 client.update_run(
                     self.run.id,
                     end_time=datetime.utcnow(),
-                    outputs=outputs
+                    outputs=redact_payload(self.outputs)
                 )
         except Exception as e:
             logger.warning(f"Failed to update LangSmith run: {e}")
@@ -112,7 +116,7 @@ def trace_workflow_execution(
         with LangSmithTracer(
             name=f"workflow_{workflow_name}",
             run_type="chain",
-            inputs={"user_input": user_input},
+            inputs={"user_input": redact_text(user_input)},
             tags=["workflow", workflow_name],
             metadata={
                 "workflow": workflow_name,
@@ -144,16 +148,17 @@ def trace_agent_execution(
         with LangSmithTracer(
             name=f"{agent_name}_{operation}",
             run_type="agent",
-            inputs=inputs,
+            inputs=redact_payload(inputs),
             tags=["agent", agent_name, operation],
             metadata={
                 "agent": agent_name,
                 "operation": operation,
                 "timestamp": datetime.utcnow().isoformat(),
                 "execution_time": execution_time,
-            }
+            },
+            outputs=output,
         ):
-            pass
+            return
     except Exception as e:
         logger.warning(f"Failed to trace agent execution: {e}")
 
@@ -172,15 +177,16 @@ def trace_tool_call(
         with LangSmithTracer(
             name=f"tool_{tool_name}",
             run_type="tool",
-            inputs=tool_input,
+            inputs=redact_payload(tool_input),
             tags=["tool", tool_name],
             metadata={
                 "tool": tool_name,
                 "timestamp": datetime.utcnow().isoformat(),
                 "error": error,
-            }
+            },
+            outputs=tool_output,
         ):
-            pass
+            return
     except Exception as e:
         logger.warning(f"Failed to trace tool call: {e}")
 
@@ -200,16 +206,17 @@ def trace_llm_call(
         with LangSmithTracer(
             name=f"llm_{model}",
             run_type="llm",
-            inputs={"prompt": prompt, "temperature": temperature},
+            inputs={"prompt": redact_text(prompt), "temperature": temperature},
             tags=["llm", model],
             metadata={
                 "model": model,
                 "temperature": temperature,
                 "tokens": tokens_used,
                 "timestamp": datetime.utcnow().isoformat(),
-            }
+            },
+            outputs={"response": redact_text(response)} if response is not None else None,
         ):
-            pass
+            return
     except Exception as e:
         logger.warning(f"Failed to trace LLM call: {e}")
 
@@ -228,7 +235,7 @@ def trace_vector_search(
         with LangSmithTracer(
             name="vector_search",
             run_type="tool",
-            inputs={"query": query},
+            inputs={"query": redact_text(query)},
             tags=["search", "vector", "retrieval"],
             metadata={
                 "query_length": len(query),

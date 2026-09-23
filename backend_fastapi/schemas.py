@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, validator
 
@@ -42,6 +43,11 @@ class GoogleLoginRequest(BaseModel):
 class TaskBase(BaseModel):
     title: str = Field(..., min_length=3, max_length=255)
     description: Optional[str] = Field("", max_length=1000)
+    completed: bool = False
+    created_at: Optional[datetime] = None
+    due_at: Optional[datetime] = None
+    priority: Literal["low", "medium", "high"] = "medium"
+    estimated_hours: Optional[float] = Field(None, ge=0, le=10000)
 
     @validator("title")
     def title_must_not_be_blank(cls, value: str) -> str:
@@ -62,6 +68,9 @@ class TaskUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=3, max_length=255)
     description: Optional[str] = Field(None, max_length=1000)
     completed: Optional[bool] = None
+    due_at: Optional[datetime] = None
+    priority: Optional[Literal["low", "medium", "high"]] = None
+    estimated_hours: Optional[float] = Field(None, ge=0, le=10000)
 
     @validator("title")
     def title_must_not_be_blank(cls, value: Optional[str]) -> Optional[str]:
@@ -86,8 +95,17 @@ class BulkCreateRequest(BaseModel):
     tasks: List[TaskCreate]
 
 
+class TaskPredictionRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field("", max_length=2000)
+    created_at: Optional[datetime] = None
+
+
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=1000)
+    task_id: Optional[int] = None
+    project: Optional[str] = None
+    document_type: Optional[str] = None
 
 
 class SearchResult(BaseModel):
@@ -95,6 +113,8 @@ class SearchResult(BaseModel):
     title: str
     content: str
     similarity_score: float
+    citation_id: Optional[str] = None
+    chunk_index: Optional[int] = None
 
 
 class IndexDocumentsRequest(BaseModel):
@@ -105,6 +125,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     use_context: bool = Field(True, description="Whether to retrieve context for the query")
     use_tools: bool = Field(True, description="Whether to enable tool calling")
+    conversation_id: Optional[str] = Field(None, max_length=100)
 
 
 class ChatResponse(BaseModel):

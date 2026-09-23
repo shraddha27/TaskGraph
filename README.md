@@ -20,6 +20,11 @@ The app works like this:
 4. FastAPI handles AI features like semantic search, chat, and embeddings.
 5. PostgreSQL stores users, tasks, roles, and vector documents.
 
+## Intelligent Task Management System: AI and RAG Platform
+
+- Fine-tuned `TinyLlama-1.1B-Chat-v1.0` with PyTorch, supervised fine-tuning (SFT), and Low-Rank Adaptation (LoRA) for task-oriented assistant responses and tool calling.
+- Adapted `all-MiniLM-L6-v2`, based on `nreimers/MiniLM-L6-H384-uncased`, with contrastive learning for domain-specific semantic search and task retrieval.
+
 In simple words, Angular is the screen, Django is the main task engine, FastAPI is the AI engine, and PostgreSQL is the memory.
 
 ## Overall Flow

@@ -13,6 +13,7 @@ export class TaskListComponent implements OnInit {
   tasks: Task[] = [];
   newTitle = "";
   newDescription = "";
+  newPriority: "low" | "medium" | "high" = "medium";
   loading = false;
   generalError = "";
   fieldErrors: { [key: string]: string } = {};
@@ -83,11 +84,13 @@ export class TaskListComponent implements OnInit {
       .addTask({
         title: this.newTitle.trim(),
         description: this.newDescription.trim(),
+        priority: this.newPriority,
       })
       .subscribe({
         next: () => {
           this.newTitle = "";
           this.newDescription = "";
+          this.newPriority = "medium";
           this.fieldErrors = {};
           this.loadTasks();
           this.loadStats();
@@ -110,6 +113,29 @@ export class TaskListComponent implements OnInit {
         this.generalError = this.getErrorMessage(error);
       },
     });
+  }
+
+  applyIntervention(task: Task): void {
+    this.service.applyTaskIntervention(task.id).subscribe({
+      next: () => {
+        this.loadTasks();
+        this.loadStats();
+      },
+      error: (error: ApiError) => {
+        this.generalError = this.getErrorMessage(error);
+      },
+    });
+  }
+
+  getRiskClass(task: Task): string {
+    return task.risk_level || "low";
+  }
+
+  getRiskText(task: Task): string {
+    if (!task.intervention_required) {
+      return "Healthy";
+    }
+    return (task.risk_level || "low").toUpperCase();
   }
 
   deleteTask(taskId: number): void {

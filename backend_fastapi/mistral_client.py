@@ -14,6 +14,8 @@ import requests
 MISTRAL_BASE_URL = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").rstrip("/")
 DEFAULT_MODEL = os.getenv("MISTRAL_MODEL", "mistral-tiny")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 HTTP_TIMEOUT = float(os.getenv("MISTRAL_TIMEOUT", "45.0"))
 LOCAL_AGENT_NAME = "task-mini-agent"
 VERIFY_SSL = os.getenv("MISTRAL_VERIFY_SSL", "false").lower() not in {"0", "false", "no", "off"}
@@ -353,6 +355,21 @@ def _extract_response_content(payload: Dict[str, Any]) -> str:
     return str(message.get("content", "")).strip()
 
 
+async def _ollama_chat_completion(messages: List[Dict[str, str]], model: Optional[str] = None) -> str:
+    if not OLLAMA_BASE_URL:
+        raise RuntimeError("OLLAMA_BASE_URL is not configured")
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=VERIFY_SSL) as client:
+        response = await client.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={"model": model or OLLAMA_MODEL, "messages": messages, "stream": False},
+        )
+        response.raise_for_status()
+        content = (response.json().get("message") or {}).get("content", "")
+        if not content:
+            raise RuntimeError("Ollama returned an empty response")
+        return str(content).strip()
+
+
 def generate_response(
     prompt: str,
     context: Optional[str] = None,
@@ -459,6 +476,8 @@ async def chat_with_tools(
         "When tool results contain task lists, include the title, status, and a short description for each task. "
         "When tool results contain statistics, clearly report completed, pending, and total counts. "
         "When context is relevant, use it to support the answer; if it is unrelated, ignore it. "
+            "When source context includes citation IDs such as [doc-12-chunk-0], cite the IDs after supported claims. "
+            "Never invent citation IDs or present unsupported claims as facts. If the sources are insufficient, say so. "
         "Do not invent deadlines, ownership, or schedule details that are not provided. "
         "If the user asks to create or update a task, ask for the missing fields only if needed. "
         "If the request is ambiguous, briefly ask a clarifying question instead of guessing."
@@ -476,6 +495,16 @@ async def chat_with_tools(
         user_payload += f"\n\nTool Results:\n{tool_results}"
 
     messages.append({"role": "user", "content": user_payload})
+
+    provider = os.getenv("LLM_PROVIDER", "mistral").strip().lower()
+    if provider == "ollama" and OLLAMA_BASE_URL:
+        try:
+            content = await _ollama_chat_completion(messages, model=model if model != DEFAULT_MODEL else OLLAMA_MODEL)
+            return content if validate_ai_output(content) else _local_model_response(
+                safe_user_message, context=context, tool_results=tool_results, force_natural=force_natural
+            )
+        except Exception as exc:
+            logger.warning("Ollama provider failed; using local fallback: %s", exc)
 
     try:
         logger.info(
@@ -512,6 +541,11 @@ async def chat_with_tools(
             "Mistral async request failed, falling back to local response: %s",
             exc,
         )
+        if OLLAMA_BASE_URL and provider != "ollama":
+            try:
+                return await _ollama_chat_completion(messages, model=OLLAMA_MODEL)
+            except Exception as ollama_exc:
+                logger.warning("Ollama fallback failed: %s", ollama_exc)
         return _local_model_response(
             safe_user_message,
             context=context,
@@ -521,4 +555,13 @@ async def chat_with_tools(
 
 async def check_ollama_health() -> bool:
     """Check whether a usable LLM provider configuration is available."""
-    return bool(MISTRAL_API_KEY)
+    if MISTRAL_API_KEY:
+        return True
+    if OLLAMA_BASE_URL:
+        try:
+            async with httpx.AsyncClient(timeout=5, verify=VERIFY_SSL) as client:
+                response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+                return response.is_success
+        except Exception:
+            return False
+    return False
