@@ -107,6 +107,12 @@ export class AppService {
     );
   }
 
+  applyTaskIntervention(taskId: number): Observable<any> {
+    return this.http
+      .post<ApiResponse<any>>(`${this.apiUrl}${taskId}/intervene/`, {})
+      .pipe(catchError(this.handleError));
+  }
+
   bulkUpdateTasks(
     taskIds: number[],
     completed: boolean,

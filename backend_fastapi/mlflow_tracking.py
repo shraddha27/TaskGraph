@@ -10,6 +10,15 @@ from typing import Any, Dict, Optional
 from functools import wraps
 import logging
 
+from backend_fastapi.ops import (
+    calculate_llm_cost,
+    estimate_tokens,
+    evaluate_retrieval,
+    get_runtime_metadata,
+    record_llm_observation,
+    record_metric,
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -118,6 +127,7 @@ class MLflowTracker:
                 mlflow.set_tags({
                     "mistral_model": MISTRAL_MODEL,
                     "mistral_available": str(MISTRAL_API_KEY_PRESENT),
+                    **get_runtime_metadata(),
                     **self.tags
                 })
                 return self.run
@@ -129,6 +139,7 @@ class MLflowTracker:
         mlflow.set_tags({
             "mistral_model": MISTRAL_MODEL,
             "mistral_available": str(MISTRAL_API_KEY_PRESENT),
+            **get_runtime_metadata(),
             **self.tags
         })
 
@@ -226,6 +237,8 @@ def track_vector_search(query: str, results_count: int, similarity_threshold: fl
     mlflow.log_param("search_query_length", len(query))
     mlflow.log_metric("retrieval_result_count", results_count)
     mlflow.log_param("similarity_threshold", similarity_threshold)
+    record_metric("retrieval_requests_total")
+    record_metric("retrieval_results_total", results_count)
 
 
 def track_workflow_execution(workflow_name: str, input_text: str, execution_time: float, agent_count: int = 0):
@@ -262,18 +275,21 @@ def log_retrieval_quality(query: str, results: list, ground_truth_ids: Optional[
         mlflow.log_param("query", query)
         mlflow.log_metric("result_count", len(results))
         
-        if ground_truth_ids and results:
+        if ground_truth_ids:
             retrieved_ids = [r.get("id") for r in results]
-            relevant = len(set(retrieved_ids) & set(ground_truth_ids))
-            precision = relevant / len(retrieved_ids) if retrieved_ids else 0
-            recall = relevant / len(ground_truth_ids) if ground_truth_ids else 0
-            
-            mlflow.log_metric("precision", precision)
-            mlflow.log_metric("recall", recall)
+            metrics = evaluate_retrieval(retrieved_ids, ground_truth_ids, k=len(results) or 10)
+            for metric_name, metric_value in metrics.items():
+                mlflow.log_metric(metric_name, metric_value)
             
             # Log result similarities
             avg_similarity = sum(r.get("similarity_score", 0) for r in results) / len(results) if results else 0
             mlflow.log_metric("avg_similarity_score", avg_similarity)
+
+
+def log_answer_quality(metrics: Dict[str, float]):
+    """Log lightweight answer-quality signals within the active request run."""
+    for metric_name, metric_value in metrics.items():
+        mlflow.log_metric(f"answer_{metric_name}", float(metric_value))
 
 
 def log_mistral_call(prompt: str, response: str, model: str, temperature: float, latency: float):
@@ -289,10 +305,17 @@ def log_mistral_call(prompt: str, response: str, model: str, temperature: float,
         mlflow.log_metric("latency_seconds", latency)
         
         # Log token estimates (rough approximation)
-        prompt_tokens_estimate = len(prompt) // 4
-        response_tokens_estimate = len(response) // 4
+        prompt_tokens_estimate = estimate_tokens(prompt)
+        response_tokens_estimate = estimate_tokens(response)
         mlflow.log_metric("prompt_tokens_estimate", prompt_tokens_estimate)
         mlflow.log_metric("response_tokens_estimate", response_tokens_estimate)
+        estimated_cost = calculate_llm_cost(prompt_tokens_estimate, response_tokens_estimate)
+        mlflow.log_metric("estimated_cost_usd", estimated_cost)
+        record_llm_observation(
+            latency=latency,
+            prompt_tokens=prompt_tokens_estimate,
+            response_tokens=response_tokens_estimate,
+        )
 
 
 def get_active_run_id():

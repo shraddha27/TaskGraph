@@ -39,6 +39,23 @@ LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=your_api_key_here  # Get from https://smith.langchain.com
 LANGSMITH_PROJECT=task-assistant-ai
 LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+
+# MLOps and LLMOps version metadata
+SERVICE_VERSION=dev
+APP_ENV=development
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+LLM_PROVIDER=mistral
+MISTRAL_MODEL=mistral-tiny
+PROMPT_VERSION=v1
+
+# Production operations
+OPS_METRICS_TOKEN=change-this-in-production
+MODEL_REGISTRY_NAME=task-assistant
+MODEL_VERSION=2026-09-10
+MODEL_STAGE=production
+MLFLOW_REGISTRY_URI=http://localhost:5000
+LLM_INPUT_USD_PER_MILLION=0
+LLM_OUTPUT_USD_PER_MILLION=0
 ```
 
 ### Example: Production AWS Configuration
@@ -147,6 +164,83 @@ LangSmith traces:
 - Full response
 - Model settings
 - Timestamps
+
+### Retrieval Evaluation
+
+Use `backend_fastapi.ops.evaluate_retrieval()` with retrieved IDs and labeled
+relevant IDs to calculate `precision_at_k`, `recall_at_k`, `mrr_at_k`, and
+`ndcg_at_k`. The same metrics are emitted by
+`log_retrieval_quality()` into MLflow, making semantic, lexical, and RRF
+experiments comparable.
+
+Every MLflow run also receives the service version, embedding model, LLM
+model, prompt version, environment, and Python version as tags. This keeps
+production observations tied to the code and model configuration that created
+them.
+
+## Production Operations
+
+The FastAPI service exposes:
+
+- `GET /api/ops/health` for readiness checks and safe runtime/model metadata.
+- `GET /api/ops/metrics` for process-local counters. Set `OPS_METRICS_TOKEN`
+  to require the `X-Ops-Token` header.
+
+LangSmith inputs, outputs, and errors are redacted for common bearer tokens,
+API keys, email addresses, and phone numbers before they leave the service.
+Applications should still avoid sending secrets in prompts.
+
+LLM cost is calculated from token estimates and the configured per-million-token
+rates. Set `LLM_INPUT_USD_PER_MILLION` and `LLM_OUTPUT_USD_PER_MILLION` for
+meaningful cost estimates.
+
+`MODEL_VERSION`, `PROMPT_VERSION`, and `MODEL_STAGE` provide the deployment
+contract used by the health endpoint and telemetry tags. External approval and
+artifact storage remain the responsibility of the configured MLflow registry.
+
+### LLMOps Features
+
+- Send an optional `conversation_id` to `/api/ai/chat/`; user and assistant
+  messages are persisted in `conversation_messages` and the latest turns are
+  supplied as bounded context.
+- Configure `LLM_PROVIDER=mistral` or `LLM_PROVIDER=ollama`. If Mistral fails
+  and `OLLAMA_BASE_URL` is configured, Ollama is attempted before the local
+  deterministic fallback.
+- Chat responses include lightweight `quality` signals: answer presence,
+  evidence overlap, uncertainty disclosure, and a combined quality score.
+  These are logged to MLflow as `answer_*` metrics.
+
+The quality score is an operational signal based on available context and tool
+results. It is not a replacement for human review or a model-based factuality
+evaluation, so production teams should add labeled answer evaluations before
+using it as an automatic release blocker.
+
+### CI Quality Gate
+
+The workflow in `.github/workflows/quality-gate.yml` runs operations tests and
+the JSON-driven retrieval evaluation. Replace
+`backend_fastapi/evaluation/retrieval_cases.json` with labeled task queries as
+real evaluation data becomes available. Gate thresholds are controlled by
+`MIN_RECALL_AT_K`, `MIN_MRR_AT_K`, and `MIN_NDCG_AT_K`.
+
+### Embedding MLOps
+
+Embedding training is run with
+`backend_fastapi/sentence_transformer_task_finetune.py`. It creates query/task
+positive pairs, trains with a contrastive retrieval loss, saves the model, and
+writes `embedding_manifest.json` with the model fingerprint, dimension, and
+training settings.
+
+The deployed service reports the active embedding backend and model identity at
+`GET /api/ops/health`. Docker backend selection is configurable with
+`USE_SENTENCE_TRANSFORMERS` and `USE_REMOTE_EMBEDDING_API`; local models are
+mounted through `LOCAL_EMBEDDING_MODEL_PATH`.
+
+Embedding latency, request count, dimension, and errors are available through
+`GET /api/ops/metrics`. Run
+`evaluate_embedding_drift.py` against a reference sample and a current sample
+to detect dimension changes, centroid movement, or norm changes before
+promotion.
 
 ## Accessing Tracked Data
 

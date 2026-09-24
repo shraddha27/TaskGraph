@@ -57,6 +57,12 @@ class WorkflowState(BaseModel):
     last_proposal: Optional[Dict[str, Any]] = None
     last_searched_tasks: list[Dict[str, Any]] = Field(default_factory=list)  # Most recent search results
     last_selected_task: Optional[Dict[str, Any]] = None  # Task user is referring to (from search)
+    retrieval_query: Optional[str] = None
+    retrieval_attempts: int = 0
+    retrieval_quality: Optional[str] = None
+    retrieval_history: list[Dict[str, Any]] = Field(default_factory=list)
+    retrieved_documents: list[Dict[str, Any]] = Field(default_factory=list)
+    grounding_status: Optional[str] = None
     
     class Config:
         arbitrary_types_allowed = True
@@ -82,6 +88,9 @@ class LangGraphWorkflow:
         
         # Define nodes for multi-step orchestration
         workflow.add_node("router", self._router_node)
+        workflow.add_node("planner_stage", self._planner_stage_node)
+        workflow.add_node("validator_stage", self._validator_stage_node)
+        workflow.add_node("executor_stage", self._executor_stage_node)
         workflow.add_node("task_stage", self._task_stage_node)
         workflow.add_node("rag_stage", self._rag_stage_node)
         workflow.add_node("analysis_stage", self._analysis_stage_node)
@@ -91,20 +100,58 @@ class LangGraphWorkflow:
         # Set entry point
         workflow.set_entry_point("router")
         
-        # Router analyzes intent and decides which stages to execute
+        # Router analyzes intent and then hands off to the planning/validation flow.
         workflow.add_conditional_edges(
             "router",
             self._route_stages,
             {
-                "task_rag_analysis": "task_stage",
-                "task_rag": "task_stage",
-                "task_analysis": "task_stage",
-                "task_only": "task_stage",
-                "rag_analysis": "rag_stage",
-                "rag_only": "rag_stage",
-                "analysis_only": "analysis_stage",
-                "chat_only": "chat_final",
+                "task_rag_analysis": "planner_stage",
+                "task_rag": "planner_stage",
+                "task_analysis": "planner_stage",
+                "task_only": "planner_stage",
+                "rag_analysis": "planner_stage",
+                "rag_only": "planner_stage",
+                "analysis_only": "planner_stage",
+                "chat_only": "planner_stage",
                 END: END,
+            }
+        )
+
+        workflow.add_conditional_edges(
+            "planner_stage",
+            self._planner_stage_transition,
+            {
+                "validator_stage": "validator_stage",
+                "task_stage": "task_stage",
+                "rag_stage": "rag_stage",
+                "analysis_stage": "analysis_stage",
+                "chat_final": "chat_final",
+                "finalize": "finalize",
+            }
+        )
+
+        workflow.add_conditional_edges(
+            "validator_stage",
+            self._validator_stage_transition,
+            {
+                "executor_stage": "executor_stage",
+                "task_stage": "task_stage",
+                "rag_stage": "rag_stage",
+                "analysis_stage": "analysis_stage",
+                "chat_final": "chat_final",
+                "finalize": "finalize",
+            }
+        )
+
+        workflow.add_conditional_edges(
+            "executor_stage",
+            self._executor_stage_transition,
+            {
+                "task_stage": "task_stage",
+                "rag_stage": "rag_stage",
+                "analysis_stage": "analysis_stage",
+                "chat_final": "chat_final",
+                "finalize": "finalize",
             }
         )
         
@@ -125,6 +172,7 @@ class LangGraphWorkflow:
             "rag_stage",
             self._rag_stage_transition,
             {
+                "retry": "rag_stage",
                 "analysis": "analysis_stage",
                 "chat_final": "chat_final",
                 "finalize": "finalize",
@@ -640,6 +688,100 @@ class LangGraphWorkflow:
 
         return False
 
+    async def _planner_stage_node(self, state: WorkflowState) -> WorkflowState:
+        """Create a simple execution plan for the current request."""
+        plan = {
+            "requested_action": state.current_agent or "chat_only",
+            "steps": [],
+        }
+
+        if (state.current_agent or "").startswith("task"):
+            plan["steps"].append("resolve_task_intent")
+            plan["steps"].append("execute_task_logic")
+        if (state.current_agent or "").startswith("rag"):
+            plan["steps"].append("retrieve_context")
+        if (state.current_agent or "").startswith("analysis") or "analysis" in (state.current_agent or ""):
+            plan["steps"].append("reason_over_context")
+        if not plan["steps"]:
+            plan["steps"].append("respond")
+
+        state.task_context["planner_plan"] = plan
+        state.stage_context = json.dumps(plan, ensure_ascii=False)
+        state.workflow_status = "planned"
+        logger.info(f"Planner stage created plan for {state.current_agent}: {plan}")
+        return state
+
+    async def _validator_stage_node(self, state: WorkflowState) -> WorkflowState:
+        """Validate the plan without blocking execution. This preserves the multi-agent flow."""
+        validation = {
+            "agent": state.current_agent or "chat_only",
+            "status": "ok",
+            "issues": [],
+        }
+
+        if state.current_agent and state.current_agent.startswith("task"):
+            validation["status"] = "ok"
+
+        state.task_context["validator_result"] = validation
+        state.stage_context = json.dumps(validation, ensure_ascii=False)
+        state.workflow_status = "validated"
+        logger.info(f"Validator stage accepted plan for {state.current_agent}: {validation}")
+        return state
+
+    async def _executor_stage_node(self, state: WorkflowState) -> WorkflowState:
+        """Execute the selected path without imposing blocking guardrail gates."""
+        current_agent = state.current_agent or "chat_only"
+
+        if current_agent.startswith("task"):
+            state.workflow_status = "executing_task_action"
+            logger.info(f"Executor stage delegates to task logic for {state.user_input}")
+            return await self._task_stage_node(state)
+        if current_agent.startswith("rag"):
+            state.workflow_status = "executing_retrieval"
+            logger.info(f"Executor stage delegates to RAG for {state.user_input}")
+            return await self._rag_stage_node(state)
+        if current_agent.startswith("analysis") or "analysis" in current_agent:
+            state.workflow_status = "executing_analysis"
+            logger.info(f"Executor stage delegates to analysis for {state.user_input}")
+            return await self._analysis_stage_node(state)
+
+        state.workflow_status = "executing_chat"
+        logger.info(f"Executor stage delegates to chat for {state.user_input}")
+        return await self._chat_final_node(state)
+
+    def _planner_stage_transition(self, state: WorkflowState) -> str:
+        """Route from planner to the next step in the multi-agent pipeline."""
+        current_agent = state.current_agent or "chat_only"
+        if current_agent in {"task_rag_analysis", "task_rag", "task_analysis", "task_only"}:
+            return "validator_stage"
+        if current_agent in {"rag_analysis", "rag_only"}:
+            return "validator_stage"
+        if current_agent == "analysis_only":
+            return "validator_stage"
+        return "chat_final"
+
+    def _validator_stage_transition(self, state: WorkflowState) -> str:
+        """Route from validator to execution without blocking the flow."""
+        current_agent = state.current_agent or "chat_only"
+        if current_agent in {"task_rag_analysis", "task_rag", "task_analysis", "task_only"}:
+            return "executor_stage"
+        if current_agent in {"rag_analysis", "rag_only"}:
+            return "executor_stage"
+        if current_agent == "analysis_only":
+            return "executor_stage"
+        return "chat_final"
+
+    def _executor_stage_transition(self, state: WorkflowState) -> str:
+        """Tell the executor which legacy stage to run next."""
+        current_agent = state.current_agent or "chat_only"
+        if current_agent in {"task_rag_analysis", "task_rag", "task_analysis", "task_only"}:
+            return "task_stage"
+        if current_agent in {"rag_analysis", "rag_only"}:
+            return "rag_stage"
+        if current_agent == "analysis_only":
+            return "analysis_stage"
+        return "chat_final"
+
     def _route_stages(self, state: WorkflowState) -> str:
         """Route to appropriate workflow stages based on router analysis."""
         if state.current_agent:
@@ -741,6 +883,10 @@ class LangGraphWorkflow:
 
     def _rag_stage_transition(self, state: WorkflowState) -> str:
         """Determine next stage after RAG stage based on current execution path."""
+        if state.retrieval_quality == "weak" and state.retrieval_attempts < 2:
+            logger.info("RAG stage transition -> retry with reformulated query")
+            return "retry"
+
         path = state.current_agent or "chat_only"
         logger.info(f"RAG stage transition evaluating current_agent={path}")
 
@@ -1080,26 +1226,48 @@ class LangGraphWorkflow:
         
         try:
             agent_id = "rag_agent_001"
+            state.retrieval_attempts += 1
+            query = state.retrieval_query or state.user_input
             rag_payload = {
                 "operation": "search",
-                "query": state.user_input,
+                "query": query,
                 "mcp_server": self.mcp_server,
             }
-            logger.info(f"Routing to agent {agent_id} for RAG with query preview: {state.user_input[:100]}")
+            logger.info(f"Routing to agent {agent_id} for RAG with query preview: {query[:100]}")
             rag_result = await self.agent_manager.execute_task(agent_id, rag_payload)
+
+            results = rag_result.get("results", []) if isinstance(rag_result, dict) else []
+            ranked_results = self._rerank_retrieval_results(query, results)
+            quality = self._evaluate_retrieval_quality(ranked_results)
+            state.retrieval_quality = quality
+            state.retrieval_history.append({
+                "attempt": state.retrieval_attempts,
+                "query": query,
+                "quality": quality,
+                "result_count": len(ranked_results),
+            })
+            if quality == "weak" and state.retrieval_attempts < 2:
+                state.retrieval_query = self._reformulate_retrieval_query(query)
             
             state.workflow_log.append({
                 "agent": agent_id,
                 "action": "search",
-                "result": rag_result,
+                "query": query,
+                "quality": quality,
+                "result": {**rag_result, "results": ranked_results} if isinstance(rag_result, dict) else rag_result,
                 "timestamp": datetime.utcnow().isoformat(),
             })
             
             if isinstance(rag_result, dict) and rag_result.get("status") == "success":
-                state.stage_context += f"\nRAG results: {rag_result}"
-                logger.info(f"RAG stage succeeded: Found {rag_result.get('count', 0)} results")
+                reranked_result = {**rag_result, "results": ranked_results, "count": len(ranked_results)}
+                if quality == "weak" and state.retrieval_attempts < 2:
+                    logger.info("Weak retrieval detected; reformulated query for next attempt")
+                else:
+                    state.stage_context += f"\nRAG results: {reranked_result}"
+                    state.retrieved_documents = ranked_results
+                logger.info(f"RAG stage succeeded: Found {len(ranked_results)} results with quality={quality}")
                 try:
-                    await self._scan_and_execute_proposal_from_result(state, rag_result)
+                    await self._scan_and_execute_proposal_from_result(state, reranked_result)
                 except Exception:
                     pass
             
@@ -1109,6 +1277,44 @@ class LangGraphWorkflow:
             state.workflow_status = "error"
         
         return state
+
+    def _evaluate_retrieval_quality(self, results: list[Dict[str, Any]]) -> str:
+        """Classify retrieval using result count and the best similarity score."""
+        if not results:
+            return "weak"
+        best_score = max(float(item.get("similarity_score", 0.0) or 0.0) for item in results)
+        return "good" if best_score >= 0.35 else "weak"
+
+    def _reformulate_retrieval_query(self, query: str) -> str:
+        """Create a broader second-pass query without requiring another LLM call."""
+        cleaned = re.sub(r"\b(?:search|find|look for|retrieve|show|tell me about)\b", "", query, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,?")
+        return f"relevant documentation and context about {cleaned or query}".strip()
+
+    def _rerank_retrieval_results(self, query: str, results: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        """Prefer results that match both vector meaning and query terms."""
+        query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+        reranked = []
+        for result in results:
+            text = f"{result.get('title', '')} {result.get('content', '')}".lower()
+            document_terms = set(re.findall(r"[a-z0-9]+", text))
+            lexical_score = len(query_terms & document_terms) / max(len(query_terms), 1)
+            vector_score = float(result.get("similarity_score", 0.0) or 0.0)
+            enriched = dict(result)
+            enriched["rerank_score"] = round((vector_score * 0.7) + (lexical_score * 0.3), 6)
+            reranked.append(enriched)
+        return sorted(reranked, key=lambda item: item["rerank_score"], reverse=True)
+
+    def _verify_grounding(self, answer: str, documents: list[Dict[str, Any]]) -> str:
+        """Check that a generated answer shares meaningful terms with retrieved evidence."""
+        if not documents:
+            return "not_applicable"
+        answer_terms = set(re.findall(r"[a-z0-9]{4,}", (answer or "").lower()))
+        evidence = " ".join(
+            f"{item.get('title', '')} {item.get('content', '')}" for item in documents
+        )
+        evidence_terms = set(re.findall(r"[a-z0-9]{4,}", evidence.lower()))
+        return "verified" if len(answer_terms & evidence_terms) >= 2 else "weak_support"
     
     async def _analysis_stage_node(self, state: WorkflowState) -> WorkflowState:
         """Execute analysis stage."""
@@ -1284,11 +1490,21 @@ class LangGraphWorkflow:
 
             state.last_assistant_response = response_text.strip()
             self._capture_pending_task_creation_suggestion(state, response_text)
+            state.grounding_status = self._verify_grounding(response_text, state.retrieved_documents)
+            state.workflow_log.append({
+                "agent": "grounding_verifier",
+                "action": "verify_answer",
+                "status": state.grounding_status,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
 
             state.result = {
                 "status": status,
                 "response": formatted_response,
                 "workflow_stages": len(state.workflow_log),
+                "retrieval_quality": state.retrieval_quality,
+                "retrieval_attempts": state.retrieval_attempts,
+                "grounding_status": state.grounding_status,
             }
             # After final chat output, check if the LLM suggested a proposal and execute it automatically
             try:

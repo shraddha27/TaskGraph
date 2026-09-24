@@ -268,6 +268,80 @@ button:disabled {
   font-size: 12px;
 }
 
+.risk-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 12px 0 10px;
+}
+
+.risk-badge,
+.probability-pill,
+.intervention-banner {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.risk-badge {
+  padding: 6px 10px;
+  border: 1px solid transparent;
+}
+
+.risk-low {
+  background: #e8f5e9;
+  color: #1b5e20;
+  border-color: #81c784;
+}
+
+.risk-medium {
+  background: #fff3e0;
+  color: #e65100;
+  border-color: #ffb74d;
+}
+
+.risk-high {
+  background: #ffebee;
+  color: #b71c1c;
+  border-color: #ef9a9a;
+}
+
+.probability-pill {
+  background: #e3f2fd;
+  color: #0d47a1;
+  padding: 6px 10px;
+  border: 1px solid #90caf9;
+}
+
+.intervention-banner {
+  background: #fff8e1;
+  color: #7a4b00;
+  border: 1px solid #ffd54f;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+}
+
+.task-meta {
+  margin-top: 12px;
+}
+
+.escalate-btn {
+  background: #d32f2f;
+  color: #fff;
+}
+
+.escalate-btn:hover {
+  background: #b71c1c;
+}
+
 /* Responsive */
 @media (max-width: 640px) {
   .header-section {

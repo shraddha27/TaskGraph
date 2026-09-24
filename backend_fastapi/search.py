@@ -1,12 +1,15 @@
 import json
+import math
+import os
 import re
+import time
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from backend_fastapi.embeddings import generate_embedding, generate_embeddings_batch
+from backend_fastapi.embeddings import HF_EMBEDDING_API_TOKEN, generate_embedding, generate_embeddings_batch
 from backend_fastapi.models import DocumentModel, TaskModel
 from backend_fastapi.rag_tools import (
     execute_tool,
@@ -22,6 +25,18 @@ from backend_fastapi.rag_tools import (
 from backend_fastapi.utils import format_pgvector_literal, cosine_similarity
 
 INTENT_EXAMPLE_EMBEDDINGS_CACHE: Dict[str, List[List[float]]] = {}
+_EMBEDDING_CACHE: Dict[str, tuple[float, List[float]]] = {}
+_HYDE_CACHE: Dict[str, tuple[float, str]] = {}
+_CACHE_TTL_SECONDS = 900
+
+
+def clear_retrieval_cache() -> None:
+    """Invalidate derived retrieval data after documents are changed."""
+    _EMBEDDING_CACHE.clear()
+    _HYDE_CACHE.clear()
+
+DEFAULT_CHUNK_SIZE = 1200
+DEFAULT_CHUNK_OVERLAP = 200
 
 
 def cleanup_duplicate_documents(db: Session):
@@ -31,7 +46,7 @@ def cleanup_duplicate_documents(db: Session):
             WITH ranked AS (
                 SELECT id,
                        ROW_NUMBER() OVER (
-                           PARTITION BY task_id
+                           PARTITION BY task_id, chunk_index
                            ORDER BY created_at DESC, id DESC
                        ) AS rn
                 FROM documents
@@ -50,16 +65,128 @@ def cleanup_duplicate_documents(db: Session):
 
 
 def sync_task_document(db: Session, task: TaskModel):
+    clear_retrieval_cache()
     db.query(DocumentModel).filter(DocumentModel.task_id == task.id).delete()
     content = f"{task.title}\n{task.description}"
-    embedding = generate_embedding(content)
-    doc = DocumentModel(
-        task_id=task.id,
-        title=task.title,
-        content=content,
-        embedding=embedding,
-    )
-    db.add(doc)
+    chunks = chunk_text(content)
+    embeddings = generate_embeddings_batch(chunks)
+    for chunk_index, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        db.add(DocumentModel(
+            task_id=task.id,
+            title=task.title,
+            content=chunk,
+            embedding=embedding,
+            chunk_index=chunk_index,
+            chunk_count=len(chunks),
+        ))
+
+
+def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> List[str]:
+    """Split text at document boundaries, preserving a word overlap between chunks."""
+    source = (text or "").strip()
+    if not source:
+        return [""]
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("overlap must be non-negative and smaller than chunk_size")
+
+    units = []
+    for unit in _chunk_units(source):
+        words = unit.split()
+        if len(words) <= chunk_size:
+            units.append(unit)
+            continue
+        step = chunk_size - overlap
+        units.extend(" ".join(words[index:index + chunk_size]) for index in range(0, len(words), step))
+
+    chunks = []
+    start = 0
+    while start < len(units):
+        end = start
+        word_count = 0
+        while end < len(units):
+            unit_words = len(units[end].split())
+            if end > start and word_count + unit_words > chunk_size:
+                break
+            word_count += unit_words
+            end += 1
+            if word_count >= chunk_size:
+                break
+
+        if end == start:
+            end += 1
+        chunk = "\n\n".join(units[start:end]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(units):
+            break
+
+        # Move back to a natural unit boundary while retaining approximately
+        # the requested overlap for context continuity.
+        overlap_words = 0
+        next_start = end
+        while end - start > 1 and next_start > start and overlap_words < overlap:
+            next_start -= 1
+            overlap_words += len(units[next_start].split())
+        start = next_start if next_start > start else end
+    return chunks
+
+
+def _chunk_units(text: str) -> List[str]:
+    """Build paragraph/sentence units while keeping fenced code blocks intact."""
+    lines = text.splitlines()
+    units = []
+    current = []
+    in_code_block = False
+
+    def flush() -> None:
+        value = "\n".join(current).strip()
+        if value:
+            units.append(value)
+        current.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code_block:
+                current.append(line)
+                flush()
+                in_code_block = False
+            else:
+                flush()
+                current.append(line)
+                in_code_block = True
+            continue
+        if in_code_block:
+            current.append(line)
+            continue
+        if not stripped:
+            flush()
+            continue
+        if re.match(r"^#{1,6}\s+", stripped) and current:
+            flush()
+        current.append(line)
+    flush()
+
+    sentence_units = []
+    for unit in units:
+        if unit.lstrip().startswith("```"):
+            sentence_units.append(unit)
+            continue
+        heading = ""
+        heading_match = re.match(r"^(#{1,6}\s+[^\n]+)\n([\s\S]*)$", unit)
+        body = unit
+        if heading_match:
+            heading = heading_match.group(1).strip()
+            body = heading_match.group(2).strip()
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", body) if part.strip()]
+        if heading and sentences:
+            sentence_units.append(f"{heading}\n{sentences[0]}")
+            sentence_units.extend(sentences[1:])
+        elif heading:
+            sentence_units.append(heading)
+        else:
+            sentence_units.extend(sentences or [body])
+    return sentence_units
 
 
 def _precompute_intent_embeddings() -> None:
@@ -456,7 +583,8 @@ def vector_search(db: Session, query_embedding: List[float], limit: int = 5) -> 
         results = db.execute(
             text(
                 """
-                SELECT d.id, d.task_id, d.title, d.content,
+                  SELECT d.id, d.task_id, d.title, d.content, d.chunk_index, d.chunk_count,
+                      d.project, d.document_type, d.owner_user_id,
                        1 - (embedding <=> CAST(:embedding AS vector(384))) as similarity_score
                 FROM documents d
                 INNER JOIN tasks t ON t.id = d.task_id
@@ -473,12 +601,357 @@ def vector_search(db: Session, query_embedding: List[float], limit: int = 5) -> 
                 "task_id": r[1],
                 "title": r[2],
                 "content": r[3],
-                "similarity_score": float(r[4]),
+                "chunk_index": r[4],
+                "chunk_count": r[5],
+                "project": r[6],
+                "document_type": r[7],
+                "owner_user_id": r[8],
+                "similarity_score": float(r[9]),
             }
             for r in results
         ]
     except Exception:
         return []
+
+
+def _bm25_tokens(value: str) -> List[str]:
+    """Tokenize searchable text for the local BM25 candidate stage."""
+    return re.findall(r"[a-z0-9_]+", (value or "").lower())
+
+
+def _matches_filters(document: Any, filters: Optional[Dict[str, Any]]) -> bool:
+    if not filters:
+        return True
+    for field in ("task_id", "project", "document_type", "owner_user_id"):
+        expected = filters.get(field)
+        if expected is not None and getattr(document, field, None) != expected:
+            return False
+    return True
+
+
+def bm25_search(db: Session, query: str, limit: int = 20, filters: Optional[Dict[str, Any]] = None) -> List[dict]:
+    """Rank stored documents by BM25 lexical relevance."""
+    query_tokens = _bm25_tokens(query)
+    if not query_tokens:
+        return []
+
+    documents = [document for document in db.query(DocumentModel).all() if _matches_filters(document, filters)]
+    tokenized_documents = []
+    document_frequency: Dict[str, int] = {}
+    for document in documents:
+        # Repeat the title so exact title matches receive a modest boost.
+        tokens = _bm25_tokens(f"{document.title} {document.title} {document.content}")
+        tokenized_documents.append((document, tokens))
+        for token in set(tokens):
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    if not tokenized_documents:
+        return []
+
+    average_length = sum(len(tokens) for _, tokens in tokenized_documents) / len(tokenized_documents)
+    total_documents = len(tokenized_documents)
+    scores = []
+    for document, tokens in tokenized_documents:
+        term_frequency = {}
+        for token in tokens:
+            term_frequency[token] = term_frequency.get(token, 0) + 1
+        document_length = len(tokens) or 1
+        score = 0.0
+        for token in query_tokens:
+            frequency = term_frequency.get(token, 0)
+            if not frequency:
+                continue
+            document_count = document_frequency.get(token, 0)
+            inverse_document_frequency = math.log(
+                1 + (total_documents - document_count + 0.5) / (document_count + 0.5)
+            )
+            denominator = frequency + 1.5 * (
+                1 - 0.75 + 0.75 * document_length / max(average_length, 1.0)
+            )
+            score += inverse_document_frequency * (frequency * 2.5 / denominator)
+        if score > 0:
+            scores.append((score, document))
+
+    scores.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "id": document.id,
+            "task_id": document.task_id,
+            "title": document.title,
+            "content": document.content,
+            "chunk_index": getattr(document, "chunk_index", 0),
+            "chunk_count": getattr(document, "chunk_count", 1),
+            "citation_id": f"doc-{document.id}-chunk-{getattr(document, 'chunk_index', 0)}",
+            "bm25_score": float(score),
+        }
+        for score, document in scores[:limit]
+    ]
+
+
+def _hyde_query(query: str) -> str:
+    """Create a hypothetical answer for semantic retrieval, with a safe fallback."""
+    if os.getenv("ENABLE_HYDE_RETRIEVAL", "true").lower() not in {"1", "true", "yes", "on"}:
+        return query
+
+    cached = _HYDE_CACHE.get(query)
+    if cached and time.time() - cached[0] < _CACHE_TTL_SECONDS:
+        return cached[1]
+    try:
+        from backend_fastapi.mistral_client import generate_response
+
+        hypothetical = generate_response(
+            "Write a short hypothetical technical answer that could be found in the knowledge base. "
+            "Do not mention that it is hypothetical. Question: " + query,
+            temperature=0.2,
+        )
+        hypothetical = re.sub(r"\s+", " ", str(hypothetical or "")).strip()
+        result = hypothetical[:4000] or query
+        _HYDE_CACHE[query] = (time.time(), result)
+        return result
+    except Exception:
+        return query
+
+
+def reciprocal_rank_fusion(result_lists: List[List[dict]], limit: int = 5, k: int = 60) -> List[dict]:
+    """Fuse ranked result lists using standard reciprocal rank fusion."""
+    fused: Dict[Any, dict] = {}
+    for result_list in result_lists:
+        for rank, result in enumerate(result_list, start=1):
+            result_id = result.get("id")
+            if result_id is None:
+                continue
+            if result_id not in fused:
+                fused[result_id] = dict(result)
+                fused[result_id]["rrf_score"] = 0.0
+            fused[result_id]["rrf_score"] += 1.0 / (k + rank)
+            for key in ("bm25_score", "similarity_score", "dense_score"):
+                if key in result and key not in fused[result_id]:
+                    fused[result_id][key] = result[key]
+
+    ranked = sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)[:limit]
+    maximum = max((item["rrf_score"] for item in ranked), default=1.0)
+    for item in ranked:
+        item["rrf_score"] = float(item["rrf_score"] / maximum) if maximum else 0.0
+        item["retrieval_score"] = item["rrf_score"]
+        item.setdefault("similarity_score", float(item.get("dense_score", 0.0) or 0.0))
+    return ranked
+
+
+def cross_encoder_rerank(query: str, results: List[dict], limit: int) -> List[dict]:
+    """Optionally rerank fused results through Hugging Face or a local CrossEncoder."""
+    if os.getenv("ENABLE_CROSS_ENCODER_RERANKING", "false").lower() not in {"1", "true", "yes", "on"}:
+        return results[:limit]
+
+    pairs = [(query, f"{item.get('title', '')}\n{item.get('content', '')}") for item in results]
+    api_url = os.getenv("CROSS_ENCODER_API_URL") or os.getenv("HF_CROSS_ENCODER_API_URL")
+    api_token = (
+        os.getenv("CROSS_ENCODER_API_TOKEN")
+        or os.getenv("HF_CROSS_ENCODER_API_TOKEN")
+        or os.getenv("HF_API_TOKEN")
+        or HF_EMBEDDING_API_TOKEN
+        or os.getenv("HF_EMBEDDING_API_TOKEN")
+        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    )
+    model_name = os.getenv(
+        "CROSS_ENCODER_MODEL",
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    if not api_url and api_token:
+        api_base = os.getenv(
+            "HF_INFERENCE_API_URL",
+            "https://router.huggingface.co/hf-inference/models",
+        ).rstrip("/")
+        api_url = f"{api_base}/{model_name}"
+    if api_url and api_token:
+        try:
+            import requests
+
+            response = requests.post(
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {api_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"inputs": pairs, "parameters": {"top_k": 1}},
+                timeout=float(os.getenv("CROSS_ENCODER_API_TIMEOUT", "20")),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            scores = _parse_huggingface_reranker_scores(payload, len(results))
+            if isinstance(scores, list) and len(scores) == len(results):
+                reranked = []
+                for item, score in zip(results, scores):
+                    enriched = dict(item)
+                    enriched["cross_encoder_score"] = float(score)
+                    enriched["reranker"] = "api"
+                    reranked.append(enriched)
+                return sorted(reranked, key=lambda item: item["cross_encoder_score"], reverse=True)[:limit]
+        except Exception:
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning("Cross-encoder API failed; falling back to local reranking", exc_info=True)
+    try:
+        from sentence_transformers import CrossEncoder
+
+        model = CrossEncoder(model_name)
+        scores = model.predict(pairs)
+        reranked = []
+        for item, score in zip(results, scores):
+            enriched = dict(item)
+            enriched["cross_encoder_score"] = float(score)
+            enriched["reranker"] = "local"
+            reranked.append(enriched)
+        return sorted(reranked, key=lambda item: item["cross_encoder_score"], reverse=True)[:limit]
+    except Exception:
+        return results[:limit]
+
+
+def _parse_huggingface_reranker_scores(payload: Any, expected_count: int) -> Optional[List[float]]:
+    """Normalize common Hugging Face text-classification response shapes."""
+    if isinstance(payload, dict) and isinstance(payload.get("scores"), list):
+        return [float(score) for score in payload["scores"]]
+    if not isinstance(payload, list) or len(payload) != expected_count:
+        return None
+
+    scores = []
+    for item in payload:
+        candidates = item if isinstance(item, list) else [item]
+        if not candidates or not all(isinstance(candidate, dict) for candidate in candidates):
+            return None
+        positive = [
+            candidate for candidate in candidates
+            if str(candidate.get("label", "")).lower() in {"1", "positive", "relevant", "entailment"}
+        ]
+        selected = positive[0] if positive else max(candidates, key=lambda candidate: float(candidate.get("score", 0.0)))
+        scores.append(float(selected.get("score", 0.0)))
+    return scores
+
+
+def _hybrid_search_once(db: Session, query: str, limit: int = 5, use_hyde: bool = True, filters: Optional[Dict[str, Any]] = None) -> List[dict]:
+    """Run one BM25 and pgvector retrieval, then combine them with RRF."""
+    lexical_results = bm25_search(db, query, limit=max(limit * 4, 20), filters=filters)
+    semantic_query = _hyde_query(query) if use_hyde else query
+    embedding = _EMBEDDING_CACHE.get(semantic_query)
+    if embedding and time.time() - embedding[0] < _CACHE_TTL_SECONDS:
+        query_embedding = embedding[1]
+    else:
+        query_embedding = generate_embedding(semantic_query)
+        _EMBEDDING_CACHE[semantic_query] = (time.time(), query_embedding)
+    dense_results = vector_search(db, query_embedding, limit=max(limit * 4, 20))
+    if filters:
+        dense_results = [item for item in dense_results if all(
+            expected is None or item.get(field) == expected
+            for field, expected in filters.items()
+            if field in {"task_id", "project", "document_type", "owner_user_id"}
+        )]
+    for result in dense_results:
+        result["dense_score"] = result.get("similarity_score", 0.0)
+    fused = reciprocal_rank_fusion([lexical_results, dense_results], limit=max(limit * 2, 10))
+    return cross_encoder_rerank(query, fused, limit)
+
+
+def decompose_query(query: str, max_queries: int = 3) -> List[str]:
+    """Split a compound request into focused retrieval queries."""
+    normalized = re.sub(r"\s+", " ", (query or "").strip())
+    if not normalized:
+        return []
+
+    parts = re.split(
+        r"\s+(?:and|also|plus|then|as well as)\s+|[;?]\s*",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    queries = []
+    for part in parts:
+        part = part.strip(" .,:")
+        if len(_bm25_tokens(part)) >= 2 and part.lower() not in {item.lower() for item in queries}:
+            queries.append(part)
+
+    if len(queries) < 2:
+        return [normalized]
+    return queries[:max_queries]
+
+
+def plan_query(query: str, max_queries: int = 3) -> Dict[str, Any]:
+    """Create a validated retrieval plan, falling back to rule-based splitting."""
+    fallback_queries = decompose_query(query, max_queries=max_queries)
+    plan = {
+        "subqueries": fallback_queries,
+        "use_hyde": True,
+        "needs_analysis": len(fallback_queries) > 1,
+        "planner": "rules",
+    }
+    if len(fallback_queries) < 2:
+        return plan
+    if os.getenv("ENABLE_QUERY_PLANNER", "true").lower() not in {"1", "true", "yes", "on"}:
+        return plan
+
+    try:
+        from backend_fastapi.mistral_client import generate_response
+
+        response = generate_response(
+            "Return JSON only with keys subqueries, use_hyde, and needs_analysis. "
+            f"Create up to {max_queries} focused retrieval queries for: {query}",
+            temperature=0.1,
+        )
+        match = re.search(r"\{[\s\S]*\}", str(response or ""))
+        payload = json.loads(match.group(0)) if match else {}
+        subqueries = payload.get("subqueries")
+        if isinstance(subqueries, list):
+            cleaned = []
+            for item in subqueries:
+                item = re.sub(r"\s+", " ", str(item or "")).strip()
+                if len(_bm25_tokens(item)) >= 2 and item.lower() not in {q.lower() for q in cleaned}:
+                    cleaned.append(item)
+            if cleaned:
+                plan["subqueries"] = cleaned[:max_queries]
+                plan["use_hyde"] = bool(payload.get("use_hyde", True))
+                plan["needs_analysis"] = bool(payload.get("needs_analysis", len(cleaned) > 1))
+                plan["planner"] = "llm"
+    except Exception:
+        pass
+    return plan
+
+
+def multi_query_hybrid_search(
+    db: Session,
+    query: str,
+    limit: int = 5,
+    use_hyde: bool = True,
+    subqueries: Optional[List[str]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[dict]:
+    """Retrieve each decomposed query and fuse all candidates with RRF."""
+    if subqueries is None:
+        query_plan = plan_query(query)
+        subqueries = query_plan["subqueries"]
+        use_hyde = query_plan["use_hyde"]
+    result_lists = [
+        _hybrid_search_once(db, subquery, limit=max(limit * 2, 10), use_hyde=use_hyde, filters=filters)
+        for subquery in subqueries
+    ]
+    return reciprocal_rank_fusion(result_lists, limit=limit)
+
+
+def hybrid_search(
+    db: Session,
+    query: str,
+    limit: int = 5,
+    use_hyde: bool = True,
+    decompose: bool = True,
+    filters: Optional[Dict[str, Any]] = None,
+) -> List[dict]:
+    """Run hybrid retrieval, decomposing compound questions when useful."""
+    if decompose and len(decompose_query(query)) > 1:
+        query_plan = plan_query(query)
+        return multi_query_hybrid_search(
+            db,
+            query,
+            limit=limit,
+            use_hyde=use_hyde and query_plan["use_hyde"],
+            subqueries=query_plan["subqueries"],
+            filters=filters,
+        )
+    return _hybrid_search_once(db, query, limit=limit, use_hyde=use_hyde, filters=filters)
 
 
 def _search_relevance_boost(query: str, title: str, content: str) -> float:

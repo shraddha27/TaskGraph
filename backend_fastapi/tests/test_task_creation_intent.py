@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import types
 import unittest
@@ -86,9 +87,81 @@ from backend_fastapi.rag_tools import (
     looks_like_explicit_create_task_request,
     looks_like_task_status_update_request,
 )
+from backend_fastapi.search import bm25_search, chunk_text, decompose_query, plan_query, reciprocal_rank_fusion
 
 
 class TaskCreationIntentTests(unittest.TestCase):
+    def test_chunk_text_creates_overlapping_chunks(self):
+        chunks = chunk_text('one two three four five six', chunk_size=4, overlap=1)
+
+        self.assertEqual(chunks, ['one two three four', 'four five six'])
+
+    def test_chunk_text_preserves_code_blocks_and_headings(self):
+        text = '# API\nThe API accepts requests. It returns JSON.\n\n```python\nreturn value\n```'
+
+        chunks = chunk_text(text, chunk_size=20, overlap=2)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn('# API\nThe API accepts requests.', chunks[0])
+        self.assertIn('```python\nreturn value\n```', chunks[0])
+
+    def test_compound_queries_are_decomposed_into_focused_subqueries(self):
+        queries = decompose_query(
+            'Why are payment tasks delayed and what should we prioritize?'
+        )
+
+        self.assertEqual(
+            queries,
+            ['Why are payment tasks delayed', 'what should we prioritize'],
+        )
+
+    def test_simple_queries_are_not_decomposed(self):
+        self.assertEqual(decompose_query('Find authentication documentation'), [
+            'Find authentication documentation',
+        ])
+
+    def test_query_planner_uses_validated_llm_subqueries(self):
+        with patch.dict(os.environ, {'ENABLE_QUERY_PLANNER': 'true'}):
+            with patch(
+                'backend_fastapi.mistral_client.generate_response',
+                return_value='{"subqueries": ["payment delays", "task priority"], "use_hyde": false, "needs_analysis": true}',
+            ):
+                plan = plan_query('Why are payment tasks delayed and what should we prioritize?')
+
+        self.assertEqual(plan['planner'], 'llm')
+        self.assertEqual(plan['subqueries'], ['payment delays', 'task priority'])
+        self.assertFalse(plan['use_hyde'])
+        self.assertTrue(plan['needs_analysis'])
+
+    def test_bm25_ranks_exact_terms_and_rrf_fuses_rankings(self):
+        class Document:
+            def __init__(self, document_id, title, content):
+                self.id = document_id
+                self.task_id = document_id
+                self.title = title
+                self.content = content
+
+        class Query:
+            def all(self):
+                return [
+                    Document(1, "Authentication timeout", "OAuth token timeout troubleshooting"),
+                    Document(2, "Project planning", "Quarterly planning notes"),
+                ]
+
+        class FakeDb:
+            def query(self, model):
+                return Query()
+
+        lexical = bm25_search(FakeDb(), "authentication timeout", limit=2)
+        self.assertEqual(lexical[0]["id"], 1)
+
+        fused = reciprocal_rank_fusion(
+            [[{"id": 1, "title": "Authentication"}], [{"id": 2}, {"id": 1}]],
+            limit=2,
+        )
+        self.assertEqual(fused[0]["id"], 1)
+        self.assertEqual(fused[0]["retrieval_score"], 1.0)
+
     def test_explicit_title_and_description_are_extracted(self):
         title, description = extract_create_task_fields(
             'Please create a task with title as "Review PR" and description as "Check the release notes"'
@@ -251,6 +324,49 @@ class TaskCreationIntentTests(unittest.TestCase):
 
         self.assertEqual(len(agent_manager.calls), 1)
         self.assertEqual(agent_manager.calls[0][1]['operation'], 'search_and_create')
+
+    def test_rag_retrieval_quality_reformulates_and_reranks(self):
+        workflow = LangGraphWorkflow.__new__(LangGraphWorkflow)
+
+        self.assertEqual(workflow._evaluate_retrieval_quality([]), 'weak')
+        self.assertEqual(
+            workflow._reformulate_retrieval_query('find authentication timeout docs'),
+            'relevant documentation and context about authentication timeout docs',
+        )
+
+        ranked = workflow._rerank_retrieval_results(
+            'authentication timeout',
+            [
+                {'title': 'General notes', 'content': 'A broad overview', 'similarity_score': 0.90},
+                {'title': 'Authentication timeout', 'content': 'Token timeout troubleshooting', 'similarity_score': 0.80},
+            ],
+        )
+
+        self.assertEqual(ranked[0]['title'], 'Authentication timeout')
+        self.assertIn('rerank_score', ranked[0])
+
+    def test_rag_stage_retries_weak_results_with_reformulated_query(self):
+        class FakeAgentManager:
+            def __init__(self):
+                self.calls = []
+
+            async def execute_task(self, agent_id, payload):
+                self.calls.append(payload)
+                return {
+                    'status': 'success',
+                    'results': [{'title': 'Weak result', 'content': 'Unrelated', 'similarity_score': 0.1}],
+                    'count': 1,
+                }
+
+        workflow = LangGraphWorkflow(agent_manager=FakeAgentManager())
+        state = WorkflowState(user_input='find authentication documentation')
+
+        asyncio.run(workflow._rag_stage_node(state))
+
+        self.assertEqual(state.retrieval_quality, 'weak')
+        self.assertEqual(state.retrieval_attempts, 1)
+        self.assertIn('relevant documentation and context about', state.retrieval_query)
+        self.assertEqual(workflow._rag_stage_transition(state), 'retry')
 
     def test_task_stage_routes_bulk_documentation_completion_to_search_and_complete(self):
         class FakeAgentManager:
@@ -485,6 +601,26 @@ class TaskCreationIntentTests(unittest.TestCase):
         self.assertEqual(state.workflow_status, 'awaiting_confirmation')
         self.assertIn("I found 1 matching task(s)", state.stage_tool_results)
         self.assertIn("Reply 'confirm' to complete them.", state.stage_tool_results)
+
+    def test_task_stage_requests_confirmation_for_multiple_status_actions(self):
+        class FakeAgentManager:
+            def __init__(self):
+                self.calls = []
+
+            async def execute_task(self, agent_id, payload):
+                self.calls.append((agent_id, payload))
+                return {'status': 'success', 'tasks': [], 'tasks_found': 0}
+
+        agent_manager = FakeAgentManager()
+        workflow = LangGraphWorkflow(agent_manager=agent_manager)
+        state = WorkflowState(user_input='complete task ID 385 and reopen task ID 377')
+
+        asyncio.run(workflow._task_stage_node(state))
+
+        self.assertEqual(agent_manager.calls, [])
+        self.assertTrue(state.pending_action)
+        self.assertEqual(state.workflow_status, 'awaiting_confirmation')
+        self.assertIn("Reply 'confirm' to proceed.", state.stage_tool_results)
 
     def test_task_stage_executes_pending_action_after_confirmation(self):
         class FakeAgentManager:

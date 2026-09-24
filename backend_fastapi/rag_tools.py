@@ -354,35 +354,48 @@ def looks_like_task_status_update_request(message: str) -> Optional[str]:
     # contained words like 'complete' as an action — it's part of the create.
     if looks_like_explicit_create_task_request(message):
         return None
-    
+
     # Pattern for explicit task ID: "task #123" or "id 123"
     explicit_id_pattern = re.compile(
         r"(?:\b(?:task|tasks)\b[^\n.]{0,40}?\b(?:with\s+)?(?:id\s*)?#?\d+\b|\b(?:id\s*)?#?\d+\b[^\n.]{0,40}?\b(?:task|tasks)\b)",
         flags=re.IGNORECASE,
     )
-    
+
     # Pattern for implicit task selection: "any", "all", "pending", pronouns ("it", "that"), or contextual keywords
     implicit_selection_pattern = re.compile(
         r"\b(?:any|all|these|them|this|that|the|remaining|pending|finished|completed|done|it)\b",
         flags=re.IGNORECASE,
     )
 
-    # Prefer explicit reopen requests before completion
-    if re.search(r"\b(?:reopen|re-open|open again|uncomplete|undo complete|mark pending|mark not done)\b", lower_text):
-        # Accept reopen if explicit ID present OR if "any/all/pending" selection context exists
-        if explicit_id_pattern.search(text) or implicit_selection_pattern.search(text):
+    # Compound task-status prompts like "complete task 385 and reopen task 377"
+    # should still be recognized as a mutation request and routed through the
+    # confirmation gate instead of being silently treated as a normal search.
+    status_checks = [
+        ("reopen_task", r"\b(?:reopen|re-open|open again|uncomplete|undo complete|mark pending|mark not done)\b"),
+        ("delete_task", r"\b(?:delete|remove|erase|trash|discard)\b"),
+        ("complete_task", r"\b(?:complete|completed|done|finish|mark done|mark as done|close)\b"),
+    ]
+    matched_actions = [
+        action_name
+        for action_name, pattern in status_checks
+        if re.search(pattern, lower_text)
+        and (explicit_id_pattern.search(text) or implicit_selection_pattern.search(text))
+    ]
+    if matched_actions:
+        # Give priority to the first matching action in the order above.
+        return matched_actions[0]
+
+    # Explicit single-ID prompts must still require confirmation even if they are
+    # not in the compound-action pattern above.
+    explicit_task_id_match = re.search(r"\b(?:task|tasks)\b[^\n.]{0,40}?\b(?:id\s*)?#?\d+\b|\b(?:id\s*)?#?\d+\b[^\n.]{0,40}?\b(?:task|tasks)\b", text, flags=re.IGNORECASE)
+    if explicit_task_id_match:
+        if re.search(r"\b(?:reopen|re-open|open again|uncomplete|undo complete|mark pending|mark not done)\b", lower_text):
             return "reopen_task"
-
-    if re.search(r"\b(?:delete|remove|erase|trash|discard)\b", lower_text):
-        # Accept delete if explicit ID present OR if there is selection context
-        if explicit_id_pattern.search(text) or implicit_selection_pattern.search(text):
+        if re.search(r"\b(?:delete|remove|erase|trash|discard)\b", lower_text):
             return "delete_task"
-
-    if re.search(r"\b(?:complete|completed|done|finish|mark done|mark as done|close)\b", lower_text):
-        # Accept complete if explicit ID present OR if "any/all" or implied context (e.g., "that are pending")
-        if explicit_id_pattern.search(text) or implicit_selection_pattern.search(text):
+        if re.search(r"\b(?:complete|completed|done|finish|mark done|mark as done|close)\b", lower_text):
             return "complete_task"
-    
+
     return None
 
 
@@ -563,21 +576,9 @@ def extract_create_task_fields(message: str) -> Tuple[str, str]:
 
 def _sync_task_document(db, task) -> None:
     """Refresh the vector document for a task after any mutation."""
-    _, DocumentModel = _get_models()
+    from backend_fastapi.search import sync_task_document
 
-    db.query(DocumentModel).filter(DocumentModel.task_id == task.id).delete()
-
-    content = f"{task.title}\n{task.description}"
-    embedding = generate_embedding(content)
-
-    db.add(
-        DocumentModel(
-            task_id=task.id,
-            title=task.title,
-            content=content,
-            embedding=embedding,
-        )
-    )
+    sync_task_document(db, task)
 
 
 def _get_models():
